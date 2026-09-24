@@ -3,6 +3,21 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  blockedStepReason,
+  blockedDeliveryReason,
+} from "./quality-rules.js";
+import {
+  loadStore,
+  listRecords,
+  activeRecords,
+  findCase,
+  reportException,
+  submitRework,
+  reviewRework,
+  correctBorehole,
+  correctSliceId,
+} from "./quality-records.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "core-slices.json");
@@ -71,6 +86,14 @@ const page = `<!doctype html>
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .slice { border-top:1px solid var(--line); padding-top:10px; } .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+    [data-quality-slice] { margin-top:8px; } [data-quality-slice] select,[data-quality-slice] input { margin-top:6px; }
+    [data-quality-slice] button,[data-quality-sample] button { margin-top:6px; background:#8a5a2b; width:100%; }
+    .qc-box { border:1px dashed #b7a98f; border-radius:6px; padding:8px 10px; margin-top:8px; background:#faf7f0; }
+    .qc-title { font-weight:700; font-size:13px; color:#5c4a2e; } .qc-warn { background:#f6e3d0; border:1px solid #d49a6a; color:#7a3f12; border-radius:6px; padding:6px 8px; font-size:12px; margin:6px 0; }
+    .qc-report { font-size:12px; color:var(--muted); margin:6px 0; } .qc-photo { max-width:120px; max-height:90px; border:1px solid var(--line); border-radius:4px; margin-top:4px; }
+    .qc-rework { font-size:12px; color:var(--muted); margin:6px 0; } .qc-closed { color:var(--accent); font-size:12px; font-weight:700; margin:6px 0; }
+    .qc-hist { font-size:11px; color:var(--muted); margin:2px 0; } .qc-details { margin-top:6px; font-size:12px; } .qc-status { font-weight:400; color:var(--stone); }
+    .qc-void { font-size:12px; color:#9a3a2e; margin:4px 0; } .qc-fix { margin-top:8px; } .qc-fix button { background:var(--stone); }
     @media (max-width:950px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .stats{grid-template-columns:1fr 1fr;} }
   </style>
 </head>
@@ -107,8 +130,9 @@ const page = `<!doctype html>
       return data;
     }
     function render() {
+      window.samples = samples; window.api = api;
       stats.innerHTML = statuses.map(s => '<div class="stat"><span>'+s+'</span><strong>'+samples.filter(item => item.status === s).length+'</strong></div>').join("");
-      samplesEl.innerHTML = samples.map(sample => '<article class="card"><h3>'+sample.project+'</h3><span class="pill">'+sample.status+'</span><div class="meta">'+sample.borehole+' · '+sample.coreBox+' · '+sample.depth+' · '+sample.owner+'</div><label>新增切片</label><input data-new-slice="'+sample.id+'" placeholder="切片编号"><input data-method="'+sample.id+'" placeholder="染色方法"><button data-add="'+sample.id+'">添加切片</button>'+sample.slices.map(slice => '<div class="slice"><b>'+slice.id+'</b><div class="meta">'+slice.method+' · 当前步骤 '+slice.status+'</div><select data-step="'+sample.id+'|'+slice.id+'">'+steps.map(step => '<option>'+step+'</option>').join("")+'</select><textarea data-note="'+sample.id+'|'+slice.id+'" placeholder="步骤备注或观察结果"></textarea><button data-log="'+sample.id+'|'+slice.id+'">记录步骤</button><div class="meta">'+slice.logs.map(log => log.step+"："+log.note).join(" / ")+'</div></div>').join("")+'<button data-deliver="'+sample.id+'">标记交付</button></article>').join("");
+      samplesEl.innerHTML = samples.map(sample => '<article class="card"><h3>'+sample.project+'</h3><span class="pill">'+sample.status+'</span><div class="meta">'+sample.borehole+' · '+sample.coreBox+' · '+sample.depth+' · '+sample.owner+'</div><div data-quality-sample="'+sample.id+'"></div><label>新增切片</label><input data-new-slice="'+sample.id+'" placeholder="切片编号"><input data-method="'+sample.id+'" placeholder="染色方法"><button data-add="'+sample.id+'">添加切片</button>'+sample.slices.map(slice => '<div class="slice"><b>'+slice.id+'</b><div class="meta">'+slice.method+' · 当前步骤 '+slice.status+'</div><select data-step="'+sample.id+'|'+slice.id+'">'+steps.map(step => '<option>'+step+'</option>').join("")+'</select><textarea data-note="'+sample.id+'|'+slice.id+'" placeholder="步骤备注或观察结果"></textarea><button data-log="'+sample.id+'|'+slice.id+'">记录步骤</button><div class="meta">'+slice.logs.map(log => log.step+"："+log.note).join(" / ")+'</div><div data-quality-slice="'+sample.id+'|'+slice.id+'"></div></div>').join("")+'<button data-deliver="'+sample.id+'">标记交付</button></article>').join("");
       document.querySelectorAll("[data-step]").forEach(sel => {
         const [sampleId, sliceId] = sel.dataset.step.split("|");
         const slice = samples.find(s => s.id === sampleId).slices.find(s => s.id === sliceId);
@@ -116,15 +140,23 @@ const page = `<!doctype html>
       });
       document.querySelectorAll("[data-add]").forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.add;
-        await api('/api/samples/'+id+'/slices', { method:'POST', body: JSON.stringify({ id: document.querySelector('[data-new-slice="'+id+'"]').value, method: document.querySelector('[data-method="'+id+'"]').value || "未指定" }) });
-        await load();
+        try {
+          await api('/api/samples/'+id+'/slices', { method:'POST', body: JSON.stringify({ id: document.querySelector('[data-new-slice="'+id+'"]').value, method: document.querySelector('[data-method="'+id+'"]').value || "未指定" }) });
+          await load();
+        } catch (e) { alert(e.message); }
       });
       document.querySelectorAll("[data-log]").forEach(btn => btn.onclick = async () => {
         const [sampleId, sliceId] = btn.dataset.log.split("|");
-        await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
-        await load();
+        try {
+          await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
+          await load();
+        } catch (e) { alert(e.message); }
       });
-      document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => { await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) }); await load(); });
+      document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => {
+        try { await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) }); await load(); }
+        catch (e) { alert(e.message); }
+      });
+      if (window.afterRender) window.afterRender();
     }
     async function load(){ samples = await api("/api/samples"); render(); }
     document.querySelector("#reload").onclick = load;
@@ -135,6 +167,7 @@ const page = `<!doctype html>
     };
     load();
   </script>
+  <script src="/public/quality-page.js"></script>
 </body>
 </html>`;
 
@@ -142,10 +175,17 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
+    const store = await loadStore();
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
       return res.end(page);
     }
+    if (req.method === "GET" && url.pathname === "/public/quality-page.js") {
+      const file = await readFile(join(__dirname, "public", "quality-page.js"), "utf8");
+      res.writeHead(200, { "Content-Type":"application/javascript; charset=utf-8" });
+      return res.end(file);
+    }
+    if (req.method === "GET" && url.pathname === "/api/quality-records") return sendJson(res, 200, listRecords(store));
     if (req.method === "GET" && url.pathname === "/api/samples") return sendJson(res, 200, db.samples);
     if (req.method === "POST" && url.pathname === "/api/samples") {
       const input = await body(req);
@@ -172,6 +212,9 @@ const server = http.createServer(async (req, res) => {
       const slice = sample.slices.find(item => item.id === logMatch[2]);
       if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
       const input = await body(req);
+      const openCase = findCase(store, sample, slice);
+      const reason = openCase ? blockedStepReason(openCase, input.step) : null;
+      if (reason) return sendJson(res, 409, { error: reason });
       slice.status = input.step;
       if (input.step === "观察") slice.observation = input.note || slice.observation;
       slice.logs.push({ at: new Date().toISOString(), step: input.step, note: input.note || "" });
@@ -179,10 +222,75 @@ const server = http.createServer(async (req, res) => {
       await saveDb(db);
       return sendJson(res, 200, sample);
     }
+    const qualityReport = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/quality-report$/);
+    if (qualityReport && req.method === "POST") {
+      const sample = db.samples.find(item => item.id === qualityReport[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const slice = sample.slices.find(item => item.id === qualityReport[2]);
+      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
+      try {
+        const record = await reportException(store, sample, slice, await body(req));
+        const at = new Date().toISOString();
+        slice.logs.push({ at, step: "研磨", note: `质量异常上报（${record.id}：${record.reports[record.reports.length - 1].type}），退出观察与交付，退回研磨` });
+        sample.status = "制片中";
+        await saveDb(db);
+        return sendJson(res, 201, record);
+      } catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
+    }
+    const qualityRework = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/quality-rework$/);
+    if (qualityRework && req.method === "POST") {
+      const sample = db.samples.find(item => item.id === qualityRework[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const slice = sample.slices.find(item => item.id === qualityRework[2]);
+      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
+      try {
+        const record = await submitRework(store, sample, slice, await body(req));
+        slice.logs.push({ at: new Date().toISOString(), step: "研磨", note: `返工登记（${record.id}）：${record.rework.reason}，耗材批号 ${record.rework.materialLot}，新厚度 ${record.rework.thickness}μm` });
+        await saveDb(db);
+        return sendJson(res, 200, record);
+      } catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
+    }
+    const qualityReview = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/quality-review$/);
+    if (qualityReview && req.method === "POST") {
+      const sample = db.samples.find(item => item.id === qualityReview[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const slice = sample.slices.find(item => item.id === qualityReview[2]);
+      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
+      try {
+        const record = await reviewRework(store, sample, slice, await body(req));
+        slice.logs.push({ at: new Date().toISOString(), step: slice.status, note: `返工复核通过（${record.id}）：复核人 ${record.review.reviewer}，可继续制片` });
+        await saveDb(db);
+        return sendJson(res, 200, record);
+      } catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
+    }
+    const fixBorehole = url.pathname.match(/^\/api\/samples\/([^/]+)\/correct-borehole$/);
+    if (fixBorehole && req.method === "POST") {
+      const sample = db.samples.find(item => item.id === fixBorehole[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      try {
+        const voided = await correctBorehole(store, sample, (await body(req)).borehole);
+        await saveDb(db);
+        return sendJson(res, 200, { borehole: sample.borehole, voided });
+      } catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
+    }
+    const fixSlice = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/correct-slice-id$/);
+    if (fixSlice && req.method === "POST") {
+      const sample = db.samples.find(item => item.id === fixSlice[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const slice = sample.slices.find(item => item.id === fixSlice[2]);
+      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
+      try {
+        const voided = await correctSliceId(store, sample, slice, (await body(req)).sliceId);
+        await saveDb(db);
+        return sendJson(res, 200, { sliceId: slice.id, voided });
+      } catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
+    }
     const deliverMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/deliver$/);
     if (deliverMatch && req.method === "POST") {
       const sample = db.samples.find(item => item.id === deliverMatch[1]);
       if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const deliveryBlocked = blockedDeliveryReason(activeRecords(store), sample.id);
+      if (deliveryBlocked) return sendJson(res, 409, { error: deliveryBlocked });
       sample.delivery = "已交付";
       updateSampleStatus(sample);
       await saveDb(db);

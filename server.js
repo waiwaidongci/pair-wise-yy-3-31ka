@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { handleQualityRoute, qualityStyles, qualityScript } from "./quality-page.js";
+import { initQuality } from "./quality-records.js";
+import { isBlockedSlice, isForwardStep } from "./quality-rules.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "core-slices.json");
@@ -72,7 +75,7 @@ const page = `<!doctype html>
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .slice { border-top:1px solid var(--line); padding-top:10px; } .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
     @media (max-width:950px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .stats{grid-template-columns:1fr 1fr;} }
-  </style>
+  </style>${qualityStyles}
 </head>
 <body>
   <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><button id="reload">刷新</button></header>
@@ -108,7 +111,7 @@ const page = `<!doctype html>
     }
     function render() {
       stats.innerHTML = statuses.map(s => '<div class="stat"><span>'+s+'</span><strong>'+samples.filter(item => item.status === s).length+'</strong></div>').join("");
-      samplesEl.innerHTML = samples.map(sample => '<article class="card"><h3>'+sample.project+'</h3><span class="pill">'+sample.status+'</span><div class="meta">'+sample.borehole+' · '+sample.coreBox+' · '+sample.depth+' · '+sample.owner+'</div><label>新增切片</label><input data-new-slice="'+sample.id+'" placeholder="切片编号"><input data-method="'+sample.id+'" placeholder="染色方法"><button data-add="'+sample.id+'">添加切片</button>'+sample.slices.map(slice => '<div class="slice"><b>'+slice.id+'</b><div class="meta">'+slice.method+' · 当前步骤 '+slice.status+'</div><select data-step="'+sample.id+'|'+slice.id+'">'+steps.map(step => '<option>'+step+'</option>').join("")+'</select><textarea data-note="'+sample.id+'|'+slice.id+'" placeholder="步骤备注或观察结果"></textarea><button data-log="'+sample.id+'|'+slice.id+'">记录步骤</button><div class="meta">'+slice.logs.map(log => log.step+"："+log.note).join(" / ")+'</div></div>').join("")+'<button data-deliver="'+sample.id+'">标记交付</button></article>').join("");
+      samplesEl.innerHTML = samples.map(sample => '<article class="card" data-sample-id="'+sample.id+'"><h3>'+sample.project+'</h3><span class="pill">'+sample.status+'</span><div class="meta">'+sample.borehole+' · '+sample.coreBox+' · '+sample.depth+' · '+sample.owner+'</div><label>新增切片</label><input data-new-slice="'+sample.id+'" placeholder="切片编号"><input data-method="'+sample.id+'" placeholder="染色方法"><button data-add="'+sample.id+'">添加切片</button>'+sample.slices.map(slice => '<div class="slice" data-slice-id="'+slice.id+'"><b>'+slice.id+'</b><span class="qc-flag" data-block-flag="'+slice.id+'">'+(isBlockedSlice(slice) ? ' · 异常封锁（研磨返工中）' : '')+'</span><div class="meta">'+slice.method+' · 当前步骤 '+slice.status+'</div><select data-step="'+sample.id+'|'+slice.id+'">'+steps.map(step => '<option>'+step+'</option>').join("")+'</select><textarea data-note="'+sample.id+'|'+slice.id+'" placeholder="步骤备注或观察结果"></textarea><button data-log="'+sample.id+'|'+slice.id+'">记录步骤</button><div class="meta">'+slice.logs.map(log => log.step+"："+log.note).join(" / ")+'</div></div>').join("")+'<button data-deliver="'+sample.id+'">标记交付</button></article>').join("");
       document.querySelectorAll("[data-step]").forEach(sel => {
         const [sampleId, sliceId] = sel.dataset.step.split("|");
         const slice = samples.find(s => s.id === sampleId).slices.find(s => s.id === sliceId);
@@ -134,7 +137,7 @@ const page = `<!doctype html>
       form.reset(); await load();
     };
     load();
-  </script>
+  </script>${qualityScript}
 </body>
 </html>`;
 
@@ -142,9 +145,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
+    initQuality(db);
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
       return res.end(page);
+    }
+    if (await handleQualityRoute(req, res, url, db)) {
+      await saveDb(db);
+      return;
     }
     if (req.method === "GET" && url.pathname === "/api/samples") return sendJson(res, 200, db.samples);
     if (req.method === "POST" && url.pathname === "/api/samples") {
@@ -172,6 +180,10 @@ const server = http.createServer(async (req, res) => {
       const slice = sample.slices.find(item => item.id === logMatch[2]);
       if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
       const input = await body(req);
+      // 异常片退出观察：处置未闭环前只能停留在研磨，不能进入染色/观察
+      if (isBlockedSlice(slice) && isForwardStep(input.step)) {
+        return sendJson(res, 409, { error: "slice_blocked", message: "该切片存在未闭环质量异常，复核合格前只能研磨，不能进入" + input.step });
+      }
       slice.status = input.step;
       if (input.step === "观察") slice.observation = input.note || slice.observation;
       slice.logs.push({ at: new Date().toISOString(), step: input.step, note: input.note || "" });
@@ -183,6 +195,11 @@ const server = http.createServer(async (req, res) => {
     if (deliverMatch && req.method === "POST") {
       const sample = db.samples.find(item => item.id === deliverMatch[1]);
       if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      // 异常片退出交付：任一切片处置未闭环则禁止整样本交付
+      const blocked = sample.slices.filter(isBlockedSlice);
+      if (blocked.length) {
+        return sendJson(res, 409, { error: "has_blocked_slice", message: "存在未闭环质量异常的切片（" + blocked.map(s => s.id).join("、") + "），复核合格前不能交付" });
+      }
       sample.delivery = "已交付";
       updateSampleStatus(sample);
       await saveDb(db);
